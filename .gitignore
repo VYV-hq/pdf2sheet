@@ -1,0 +1,19 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# runtime artifacts
+jobs/
+dev/
+*.log
+
+# local OCR models (download separately)
+tessdata/*.traineddata
+
+# converted / source documents
+*.pdf
+*.xlsx
+*.csv
+*.png
