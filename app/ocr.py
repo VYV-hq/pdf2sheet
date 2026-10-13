@@ -49,7 +49,16 @@ def _run(img: np.ndarray, lang: str, psm: int, whitelist=None, timeout=180):
         os.unlink(path)
 
 
-def ocr_single(img, lang, psm=7, whitelist=None, scale=1.0):
+def binarize(img, th=150):
+    """Drop gray watermark/stamp ink; keep the dark printed glyphs."""
+    if img is None:
+        return img
+    return np.where(img < th, 0, 255).astype(np.uint8)
+
+
+def ocr_single(img, lang, psm=7, whitelist=None, scale=1.0, binarize_img=False):
+    if binarize_img:
+        img = binarize(img)
     if scale != 1.0:
         img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
     # white margin so glyphs never touch the border
@@ -66,7 +75,7 @@ MAX_STACK_H = 1300   # tesseract mis-segments very tall blocks; keep chunks shor
 MARGIN_X = 20        # white margin so glyphs never touch the image border
 
 
-def ocr_stack(cells, lang, whitelist=None, scale=1.0, gap=24):
+def ocr_stack(cells, lang, whitelist=None, scale=1.0, gap=24, binarize_img=False):
     """OCR a list of cell crops (grayscale ndarrays, or None for blanks).
 
     Returns list of (text, conf) aligned with `cells`. Cells are stacked
@@ -81,6 +90,8 @@ def ocr_stack(cells, lang, whitelist=None, scale=1.0, gap=24):
 
     imgs = []
     for _, c in live:
+        if binarize_img:
+            c = binarize(c)
         if scale != 1.0:
             c = cv2.resize(c, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
         imgs.append(c)
@@ -136,7 +147,8 @@ def ocr_stack(cells, lang, whitelist=None, scale=1.0, gap=24):
     for k, (orig_i, cell) in enumerate(live):
         txt, conf = results[orig_i]
         if conf < 40:
-            t2, c2 = ocr_single(cell, lang, psm=7, whitelist=whitelist, scale=scale)
+            t2, c2 = ocr_single(cell, lang, psm=7, whitelist=whitelist, scale=scale,
+                                binarize_img=binarize_img)
             if c2 > conf:
                 results[orig_i] = (t2, c2)
     return results

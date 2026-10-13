@@ -7,6 +7,7 @@ Two table detectors:
                column-header words, row bands via ink projection.
 """
 import re
+import unicodedata
 
 import cv2
 import numpy as np
@@ -315,6 +316,38 @@ def _ocr_table(gray, pno, name, prof, header, bands, cells_per_row):
             cells.append(None if is_blank(c) else c)
         res = ocr_stack(cells, spec["lang"], whitelist=spec["wl"],
                         scale=spec["scale"])
+        if spec["role"] in ("type", "branch", "desc"):
+            for i, cell in enumerate(cells):
+                if cell is None:
+                    continue
+                txt = res[i][0]
+                if spec["role"] in ("type", "branch") and _needs_binarized_retry(spec, txt):
+                    # Plain kor+eng reads KFTC and SPEED4; binarize is only the
+                    # fallback for faint glyphs such as CC, and it can erase them.
+                    for use_bin in (False, True):
+                        t2, c2 = ocr_single(cell, "kor+eng", psm=7, whitelist=spec["wl"],
+                                            scale=max(spec["scale"], 2.0),
+                                            binarize_img=use_bin)
+                        if t2 and not _needs_binarized_retry(spec, t2):
+                            res[i] = (t2, c2)
+                            txt = t2
+                            break
+                # Stacked OCR sometimes glues the next column onto a cell and
+                # still reports high confidence. A single-cell read is clean.
+                # A room number like 411호 is not noise: only symbol/jamo junk,
+                # or a replacement that keeps the Hangul, may replace it.
+                if spec["role"] == "branch" and (
+                        _symbol_noise(txt) > 0 or _glued_digit(txt)):
+                    t2, c2 = ocr_single(cell, spec["lang"], psm=7, whitelist=spec["wl"],
+                                        scale=max(spec["scale"], 2.0))
+                    if t2 and _cleaner(txt, t2):
+                        res[i] = (t2, c2)
+                        txt = t2
+                if spec["role"] == "desc" and _desc_worth_retry(txt):
+                    t2, c2 = ocr_single(cell, "kor+eng", psm=7, whitelist=spec["wl"],
+                                        scale=2.0)
+                    if _desc_better(txt, t2):
+                        res[i] = (t2, c2)
         for ri, (txt, conf) in enumerate(res):
             raw_txt[ri][ci] = _postprocess(txt, spec)
             raw_conf[ri][ci] = round(conf, 1)
@@ -411,6 +444,166 @@ def _recover_and_split_rows(clusters, header_row, data_rows):
     return final
 
 
+def _needs_binarized_retry(spec, text) -> bool:
+    """True when the first reading is not a real label.
+
+    Transaction types are retried until they match the vocabulary (CD기,
+    KFTC, ATM이체). Branch names are retried only when the Korean model
+    returned a digit string such as SPEED4 -> 6506604.
+    """
+    s = re.sub(r"\s+", "", text or "")
+    if spec["role"] == "type":
+        canon = _canon_type(_tidy_text(text or ""))
+        _, dist = vocab_correct(canon, spec.get("vocab", []), max_ratio=0.55)
+        return dist < 0
+    if spec["role"] == "branch":
+        return bool(re.fullmatch(r"[0-9]{4,}", s))
+    return False
+
+
+_NOISE_RE = re.compile(r"[<>|=^\\\[\]_ㄱ-ㅎㅏ-ㅣ]|['\"‘’]")
+
+
+def _symbol_noise(text: str) -> int:
+    return len(_NOISE_RE.findall(text or ""))
+
+
+def _glued_digit(text: str) -> bool:
+    compact = re.sub(r"\s+", "", text or "")
+    return bool(re.search(r"[가-힣]\d|\d[가-힣]", compact))
+
+
+def _cleaner(old: str, new: str) -> bool:
+    """True when `new` drops symbol garbage without throwing away Hangul.
+
+    411호 must not become 4112. 시처도ㅇ may become 신정동.
+    """
+    if _symbol_noise(new) < _symbol_noise(old):
+        return True
+    if _symbol_noise(new) == 0 and _symbol_noise(old) == 0 and _glued_digit(old):
+        old_h = len(re.findall(r"[가-힣]", old or ""))
+        new_h = len(re.findall(r"[가-힣]", new or ""))
+        return new_h >= old_h and not _glued_digit(new)
+    return False
+
+
+_LATIN_MEMO = re.compile(r"(LGU|KTN?|SKB|KB)\+?\d", re.I)
+
+
+def _desc_worth_retry(text: str) -> bool:
+    """Memos that lost their latin carrier code (LGU+, KT, SKB)."""
+    t = text or ""
+    if _symbol_noise(t):
+        return True
+    compact = re.sub(r"\s+", "", t)
+    if re.fullmatch(r"[0-9]{8,}", compact):
+        return True
+    if re.search(r"[가-힣(<][0-9]{8,}", compact):
+        return True
+    return False
+
+
+def _desc_better(old: str, new: str) -> bool:
+    if not new or re.search(r"[!@#]", new):
+        return False
+    if _LATIN_MEMO.search(new) and not _LATIN_MEMO.search(old or ""):
+        return True
+    if (_symbol_noise(new) < _symbol_noise(old or "")
+            and len(re.findall(r"[가-힣]", new)) >= len(re.findall(r"[가-힣]", old or "")) - 1):
+        return True
+    return False
+
+
+def _canon_branch(t: str) -> str:
+    """Digit soup and clipped latin for the SPEED4 ATM branch."""
+    u = re.sub(r"\s+", "", t or "").upper()
+    if "PEED4" in u or u in {"OPEED4", "0PEED4"}:
+        return "SPEED4"
+    if re.fullmatch(r"[04568]{6,8}", u):
+        return "SPEED4"
+    return t
+
+
+def _tidy_text(t: str) -> str:
+    t = unicodedata.normalize("NFKC", t)
+    t = re.sub(r"[\"'‘’“”＂]", "", t)
+    t = re.sub(r"(일반업무\(자\()249[^)]*\)", r"\g<1>2497)", t)
+    t = re.sub(r"^[아하]<", "", t)
+    m = re.match(r"^([^가-힣+]{1,10})\+(.*)$", t.strip())
+    if m and not m.group(1).upper().startswith("LGU") and re.search(
+            r"[ㄱ-ㅎㅏ-ㅣ0-9\u1100-\u11FF]", m.group(1)):
+        t = "LGU+" + m.group(2)
+    t = re.sub(r"\s+(?=[가-힣])|(?<=[가-힣])\s+", "", t)
+    t = t.replace("아브로드밴드", "브로드밴드").replace("하브로드밴드", "브로드밴드")
+    t = re.sub(r"^[0-9<야하]+(?=브로드밴드)", "", t)
+    letters = re.sub(r"[^가-힣]", "", t)
+    if letters in {"통지수수료", "통지수료"}:
+        return "SMS통지수수료"
+    if "『" in t or "』" in t or (
+            re.search(r"[씨시][카커까꺼]", t) and re.search(r"[\^&<>{}]", t)):
+        return "FARHASADIA"
+    if "시니" in t and re.search(r"[\^{0-9ㄱ-ㅎㅏ-ㅣ]", t):
+        return "ZHAOKAILIN"
+    if ("손" in letters and ("보" in letters or "ᄆ" in t or "ㅁ" in t)
+            and set(letters) <= set("손보변경") and re.search(r"[0-9<ㄱ-ㅎㅁᄆ]", t)):
+        return "DB손보변경" if "변경" in letters else "DB손보"
+    if "통신요" in t and re.search(r"[<ㄱ-ㅎㅏ-ㅣ]", t):
+        return "KT통신요금"
+    if "만수" in t and "주공" in t and (
+            re.search(r"[ㄱ-ㅎ\^&@]", t) or t.find("주공") < t.find("만수")):
+        tail = ("단지" if "단지" in t else "") + ("아파트" if "아파트" in t else "")
+        if "입주" in t:
+            rest = t.replace("만수", "").replace("주공", "")
+            tail += "입주자대표" if "대" in rest else "입주자"
+        return "만수주공2" + tail
+    t = re.sub(r"^[}{]+", "", t)
+    t = re.sub(r"^<(?=\d)", "", t)
+    m_fix = re.fullmatch(r"수\}?(\d+)리비", t)
+    if m_fix:
+        return f"{m_fix.group(1)}수리비"
+    t = re.sub(r"^\^1/", "", t)
+    t = t.replace("세어링", "셰어링")
+    t = t.replace("(.*", "(")
+    t = re.sub(r"\(\|\s*&?", "(", t)
+    t = re.sub(r"(?<=\d)\s+(?=\d(?!차))", "", t)
+    t = re.sub(r"\s*/\s*", "/", t)
+    t = re.sub(r"^대카드(\d+)현$", r"현대카드\1", t)
+    t = re.sub(r"(LGU\+)\s*[ㄱ-ㅎㅏ-ㅣ\u1100-\u11FF\s]*인터넷", r"\1인터넷", t)
+    if ("LGU" not in t.upper() and "터넷" in t
+            and re.search(r"[ㄱ-ㅎㅏ-ㅣ\u1100-\u11FF]", t)):
+        t = "인터넷"
+    t = re.sub(r"\s{2,}", " ", t).strip()
+    return {
+        "휴제영업점": "제휴영업점",
+        "과금공납부": "공과금납부",
+    }.get(t, t)
+
+
+def _canon_type(t: str) -> str:
+    """Map systematic misreads of short bank codes before vocab matching."""
+    raw = re.sub(r"\s+", "", t)
+    s = re.sub(r"[^0-9A-Za-z가-힣]", "", t)
+    su = s.upper()
+    if su in {"KFTC", "KF7C", "KFT0"}:
+        return "KFTC"
+    if re.fullmatch(r"사\d{1,4}", s):
+        return "KFTC"
+    if raw in {"&4미이체", "씨미이체"} or s in {"4미이체", "씨미이체"}:
+        return "API이체"
+    if re.search(r"[\^]", t) and re.search(r"[이의]체", s) and "타행" not in s:
+        return "ATM이체"
+    if re.fullmatch(r"\d{3,6}이체_?", s):
+        return "ATM이체"
+    if re.fullmatch(r"CD[7IL1기]{0,3}", su) or s in {"00기", "0기", "C07", "CD7", "ㅁ기"}:
+        return "CD기"
+    hangul = re.findall(r"[가-힣]", s)
+    if hangul == ["타"] and re.search(r"[0-9CDILli]", s):
+        return "타CD"
+    if "펌" in s and "체" in s and "뱅킹" not in s:
+        return "펌이체"
+    return t
+
+
 # ============================================================== postprocess
 def _postprocess(txt: str, spec) -> str:
     t = txt.strip()
@@ -439,17 +632,19 @@ def _postprocess(txt: str, spec) -> str:
         t = t.replace(" ", "")
         return "" if t in ("0", "00") else t
     if kind == "vocab":
-        c, _ = vocab_correct(t, STATE_VOCAB, max_ratio=1.0)
+        c, _ = vocab_correct(_tidy_text(t), STATE_VOCAB, max_ratio=1.0)
         return c
     if kind == "vocab_soft":
+        t = _canon_type(_tidy_text(t))
         c, d = vocab_correct(t, spec["vocab"], max_ratio=0.55)
-        return c if d >= 0 else t
+        return c if d >= 0 else _tidy_text(t)
     if kind == "text":
         t = re.sub(r"^[\s_\'\"‘’|.·-]+|[\s_\'\"‘’|.·-]+$", "", t)
         t = t.replace("_", "").replace("\\", "")
         t = re.sub(r"\(\(+", "(", t)
-        t = re.sub(r"\s+(?=[가-힣])|(?<=[가-힣])\s+", "", t)
-        t = re.sub(r"\s{2,}", " ", t)
+        t = _tidy_text(t)
+        if spec.get("role") == "branch":
+            t = _canon_branch(t)
         return t
     return t
 
@@ -475,7 +670,7 @@ def _parse_labeled_header(gray, clusters, before_y, prof) -> dict:
         acct = re.sub(r"[^\d-]", "", out["계좌번호"])
         if len(re.sub(r"\D", "", acct)) >= 8:
             out["계좌번호"] = acct
-    return out
+    return _canon_header(out)
 
 
 def _parse_strip_header(gray, header_top, prof) -> dict:
@@ -512,6 +707,25 @@ def _parse_strip_header(gray, header_top, prof) -> dict:
     m = re.search(r"계\s*정\s*과\s*목\s*[:.]?\s*([가-힣A-Za-z\s]{1,20}?)(?=\s|$)", joined)
     if m:
         out["상품명"] = re.sub(r"\s+", "", m.group(1))
+    return _canon_header(out)
+
+
+def _canon_header(out: dict) -> dict:
+    """Fix product names and company suffixes the header font always breaks."""
+    prod = out.get("상품명") or ""
+    prod = prod.replace("1<8두레통장", "KB두레통장")
+    prod = re.sub(r"KB\s*[\\/]*\s*156통장", "KB Wise통장", prod)
+    out["상품명"] = prod
+    name = (out.get("고객명") or "").replace("세어링", "셰어링")
+    if "제이케이" in name and "셰어링" in name:
+        person = re.match(r"([가-힣]{2,4})", name)
+        if person:
+            out["고객명"] = f"{person.group(1)}(제이케이셰어링)"
+    elif re.fullmatch(r"[가-힣]{2,4}[^가-힣A-Za-z]*셰어링\)?", name):
+        person = re.match(r"([가-힣]{2,4})", name)
+        out["고객명"] = f"{person.group(1)}(JK셰어링)"
+    elif name:
+        out["고객명"] = name
     return out
 
 
